@@ -1,0 +1,15 @@
+[package]
+name = "cache-rainbow"
+version = "0.1.0"
+edition = "2021"
+authors = ["susun sujinyanslip@gmail.com"]
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["cache"]
+categories = ["cache"]
+description = "A high-performance hybrid cache solution for Rust."
+repository = "https://github.com/xiaguan/cache-rainbow"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
