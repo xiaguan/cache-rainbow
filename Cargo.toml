@@ -13,3 +13,8 @@ repository = "https://github.com/xiaguan/cache-rainbow"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+get-size = { version = "^0.1", features = ["derive"] }
+
+[[bench]]
+name = "bench_get_size"
+harness = false
