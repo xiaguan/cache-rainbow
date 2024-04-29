@@ -7,7 +7,12 @@
 # VSCode IDE config directory
 .vscode/
 
-trace.csv
 Cargo.lock
+
+trace.csv
+
+
+
 perf.data*
+
 flamegraph.svg
