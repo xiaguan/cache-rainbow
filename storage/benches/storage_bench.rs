@@ -1,13 +1,10 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock},
-    time::Duration,
-};
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use storage::MockRequest;
-use storage::{FifoFileCache, WriteReponse};
+use storage::{FifoFileCache, MockRequest, WriteResponse};
 
 /// It's mock the kv workload for storage bench.
 /// First it generates a lot of random key,value pairs.
@@ -15,7 +12,6 @@ use storage::{FifoFileCache, WriteReponse};
 /// Then it start write and read threads to do the kv workload
 /// The write thread will random pick a key,value pair and write it to the storage
 /// The read thread will random pick a key follow zipf distribution and read it from the storage
-///
 
 const CACHE_SIZE: usize = 1_000;
 const READER_COUNT: usize = 10;
@@ -35,7 +31,7 @@ impl storage::Value for TestValue {}
 
 enum CacheItenInner {
     Memory(TestValue),
-    File(WriteReponse),
+    File(WriteResponse),
     Invalid,
 }
 
@@ -52,12 +48,12 @@ impl Default for CacheItem {
 }
 
 impl CacheItem {
-    fn update_file(&self, reponse: WriteReponse) {
+    fn update_file(&self, reponse: WriteResponse) {
         let mut inner = self.inner.write().unwrap();
         *inner = CacheItenInner::File(reponse);
     }
 
-    fn read(&self, file_cache: &FifoFileCache) -> Option<(TestValue, WriteReponse)> {
+    fn read(&self, file_cache: &FifoFileCache) -> Option<(TestValue, WriteResponse)> {
         let inner = self.inner.read().unwrap();
         match &*inner {
             CacheItenInner::Memory(_) => None,
@@ -83,8 +79,8 @@ fn generate_cache() -> Cache {
 }
 
 enum OperationTrace {
-    Read(WriteReponse, Duration),
-    Write(WriteReponse, Duration),
+    Read(WriteResponse, Duration),
+    Write(WriteResponse, Duration),
     Finish,
 }
 
@@ -98,7 +94,7 @@ struct Trace {
 }
 
 fn write_thread(
-    cache: Arc<RwLock<FifoFileCache>>,
+    cache: Arc<FifoFileCache>,
     cache_map: Arc<Cache>,
     write_duration: Duration,
     write_count: u64,
@@ -109,7 +105,7 @@ fn write_thread(
         let key = rng.gen_range(0..CACHE_SIZE as u64);
         let value = TestValue::from(key);
         let start = std::time::Instant::now();
-        let response = cache.write().unwrap().write(value);
+        let response = cache.write(value);
         let elapsed = start.elapsed();
         trace_sender
             .send(OperationTrace::Write(response.clone(), elapsed))
@@ -121,9 +117,8 @@ fn write_thread(
 }
 
 fn read_thread(
-    cache: Arc<RwLock<FifoFileCache>>,
+    cache: Arc<FifoFileCache>,
     cache_map: Arc<Cache>,
-    read_duration: Duration,
     read_count: u64,
     trace_sender: std::sync::mpsc::Sender<OperationTrace>,
 ) {
@@ -132,7 +127,7 @@ fn read_thread(
         let key = rng.gen_range(0..CACHE_SIZE as u64);
         let start = std::time::Instant::now();
         let item = cache_map.items.get(&key).unwrap();
-        let value = item.read(&cache.read().unwrap());
+        let value = item.read(&cache);
         if let Some((value, reponse)) = value {
             if value != TestValue::from(key) {
                 panic!("The value should be {}, but got {}", key, value.value);
@@ -142,7 +137,6 @@ fn read_thread(
                 .send(OperationTrace::Read(reponse, elapsed))
                 .unwrap();
         }
-        std::thread::sleep(read_duration);
     }
 }
 
@@ -185,12 +179,8 @@ fn main() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test_read_write");
     let page_size = 4096;
-    let capacity = page_size * 10;
-    let cache = Arc::new(RwLock::new(FifoFileCache::new(
-        path.clone(),
-        page_size,
-        capacity,
-    )));
+    let capacity = page_size * 1024;
+    let cache = Arc::new(FifoFileCache::new(path.clone(), page_size, capacity));
     let cache_map = Arc::new(generate_cache());
 
     let (trace_sender, trace_receiver) = std::sync::mpsc::channel();
@@ -199,10 +189,9 @@ fn main() {
         write_trace(trace_receiver);
     });
 
-    let write_duration = Duration::from_millis(3);
-    let read_duration = Duration::from_millis(1);
+    let write_duration = Duration::from_millis(1);
     let write_count = CACHE_SIZE as u64 * 10;
-    let read_count = CACHE_SIZE as u64 * 20;
+    let read_count = CACHE_SIZE as u64 * 200;
 
     let write_handle = {
         let cache = cache.clone();
@@ -221,7 +210,7 @@ fn main() {
             let cache_map = read_cache_map.clone();
             let trace_sender = trace_sender.clone();
             std::thread::spawn(move || {
-                read_thread(cache, cache_map, read_duration, read_count, trace_sender);
+                read_thread(cache, cache_map, read_count, trace_sender);
             })
         })
         .collect::<Vec<_>>();

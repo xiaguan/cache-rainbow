@@ -2,7 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub use value::Value;
 
@@ -10,7 +10,7 @@ mod value;
 
 type PageVersion = AtomicU64;
 type PageID = u64;
-type PageOffest = u64;
+type PageOffset = u64;
 
 pub struct FifoFileCache {
     // The version of each page, which is incremented by 1 after each write
@@ -20,56 +20,18 @@ pub struct FifoFileCache {
     page_size: usize,
     // The path of the file
     path: PathBuf,
+    manager: Mutex<WriteManger>,
+}
+
+struct WriteManger {
+    pages: Arc<[PageVersion]>,
     write_page_id: u64,
     write_offset: u64,
+    page_size: usize,
+    file: File,
 }
 
-#[derive(Debug, Clone)]
-pub struct WriteReponse {
-    pub page_id: PageID,
-    pub page_offset: PageOffest,
-    pub version: u64,
-    pub length: usize,
-}
-
-pub trait MockRequest<V>
-where
-    V: Value,
-{
-    // Read a value from the storage
-    // Return none if the page_version is not the same as the version of the page
-    // Otherwise return the value deserialized from the page directly
-    fn read(&self, request: &WriteReponse) -> Option<V>;
-    // Write a value to the storage
-    // Return the page_id, page_offset, version, and length of the written value
-    // The page_version should be incremented by 1
-    fn write(&mut self, value: V) -> WriteReponse;
-}
-
-impl FifoFileCache {
-    pub fn new(path: PathBuf, page_size: usize, capacity: usize) -> Self {
-        debug_assert!(page_size > 0);
-        // The capacity should be a multiple of the page size
-        debug_assert!(capacity % page_size == 0);
-        debug_assert!(capacity > page_size);
-        let page_num = capacity / page_size;
-
-        // All pages are initialized to 0
-        let mut pages = Vec::with_capacity(page_num);
-        for _ in 0..page_num {
-            pages.push(AtomicU64::new(0));
-        }
-        let write_page_id = 0;
-        let write_offset = 0;
-        Self {
-            pages: pages.into(),
-            page_size,
-            path,
-            write_page_id,
-            write_offset,
-        }
-    }
-
+impl WriteManger {
     fn write_move(&mut self, value_size: u64) {
         if self.write_offset + value_size > self.page_size as u64 {
             // Increment the next page version
@@ -78,37 +40,91 @@ impl FifoFileCache {
             // Switch to the next page
             self.write_page_id = next_page_id;
             self.write_offset = 0;
+            self.file
+                .seek(SeekFrom::Start(self.write_page_id * self.page_size as u64))
+                .expect("Failed to seek file");
+            self.file.flush().expect("Failed to flush file");
         }
     }
 
-    fn write_data(&mut self, data: Vec<u8>) -> WriteReponse {
-        let offset = self.write_page_id * self.page_size as u64 + self.write_offset;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .open(&self.path)
-            .expect("Failed to open file");
-        file.seek(SeekFrom::Start(offset))
-            .expect("Failed to seek file");
-        file.write_all(&data).expect("Failed to write file");
-
-        let response = WriteReponse {
+    fn write_data(&mut self, data: Vec<u8>) -> WriteResponse {
+        let data_len = data.len();
+        self.file.write_all(&data).expect("Failed to write file");
+        let response = WriteResponse {
             page_id: self.write_page_id,
             page_offset: self.write_offset,
             version: self.pages[self.write_page_id as usize]
                 .load(std::sync::atomic::Ordering::Relaxed),
-            length: data.len(),
+            length: data_len,
         };
-        self.write_offset += data.len() as u64;
+        self.write_offset += data_len as u64;
         response
     }
 }
 
-impl<V> MockRequest<V> for FifoFileCache
-where
-    V: Value,
+#[derive(Debug, Clone)]
+pub struct WriteResponse {
+    pub page_id: PageID,
+    pub page_offset: PageOffset,
+    pub version: u64,
+    pub length: usize,
+}
+
+pub trait MockRequest<V>
+where V: Value
 {
-    fn read(&self, request: &WriteReponse) -> Option<V> {
+    // Read a value from the storage
+    // Return none if the page_version is not the same as the version of the page
+    // Otherwise return the value deserialized from the page directly
+    fn read(&self, request: &WriteResponse) -> Option<V>;
+    // Write a value to the storage
+    // Return the page_id, page_offset, version, and length of the written value
+    // The page_version should be incremented by 1
+    fn write(&self, value: V) -> WriteResponse;
+}
+
+impl FifoFileCache {
+    pub fn new(path: PathBuf, page_size: usize, capacity: usize) -> Self {
+        assert!(page_size > 0);
+        // The capacity should be a multiple of the page size
+        assert!(capacity % page_size == 0);
+        assert!(capacity > page_size);
+        let page_num = capacity / page_size;
+
+        // All pages are initialized to 0
+        let mut pages = Vec::with_capacity(page_num);
+        for _ in 0..page_num {
+            pages.push(AtomicU64::new(0));
+        }
+        let pages: Arc<[PageVersion]> = pages.into();
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&path)
+            .expect("Failed to open file");
+        let manager = Mutex::new(WriteManger {
+            pages: pages.clone(),
+            write_page_id: 0,
+            write_offset: 0,
+            page_size,
+            file,
+        });
+        Self {
+            pages,
+            page_size,
+            path,
+            manager,
+        }
+    }
+}
+
+impl<V> MockRequest<V> for FifoFileCache
+where V: Value
+{
+    fn read(&self, request: &WriteResponse) -> Option<V> {
+        assert!(request.length <= self.page_size);
+        assert!(request.page_id < self.pages.len() as u64);
+        assert!(request.page_offset + request.length as u64 <= self.page_size as u64);
         let offset = request.page_id * self.page_size as u64 + request.page_offset;
         let mut file = File::open(&self.path).expect("Failed to open file");
         file.seek(SeekFrom::Start(offset))
@@ -124,26 +140,23 @@ where
         if page_version != request.version {
             return None;
         }
-
         let value = bincode::deserialize(&buffer).expect("Failed to deserialize value");
         Some(value)
     }
 
-    fn write(&mut self, value: V) -> WriteReponse {
+    fn write(&self, value: V) -> WriteResponse {
         let serialized = bincode::serialize(&value).expect("Failed to serialize value");
         let length = serialized.len();
-        debug_assert!(length <= self.page_size);
-        self.write_move(length as u64);
-        self.write_data(serialized)
+        assert!(length <= self.page_size);
+        let mut manager = self.manager.lock().unwrap();
+        manager.write_move(length as u64);
+        manager.write_data(serialized)
     }
 }
 
 #[cfg(test)]
 mod tests {
 
-    use std::{collections::HashMap, fs};
-
-    use rand::Rng;
     use serde::{Deserialize, Serialize};
     use tempfile::tempdir;
 
@@ -162,27 +175,21 @@ mod tests {
 
     impl Value for TestValue {}
 
-    struct CacheItem {
-        value: TestValue,
-        // Write reponse
-        response: WriteReponse,
-    }
-
     #[test]
     fn test_read_write() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_read_write");
         let page_size = 8;
         let capacity = 8 * 2;
-        let mut cache = FifoFileCache::new(path.clone(), page_size, capacity);
+        let cache = FifoFileCache::new(path.clone(), page_size, capacity);
 
         let value = TestValue::from(123);
         let response = cache.write(value);
-        debug_assert!(response.page_id == 0);
-        debug_assert!(response.page_offset == 0);
-        debug_assert!(response.version == 0);
+        assert!(response.page_id == 0);
+        assert!(response.page_offset == 0);
+        assert!(response.version == 0);
 
-        let read_request = WriteReponse {
+        let read_request = WriteResponse {
             page_id: response.page_id,
             page_offset: response.page_offset,
             version: response.version,
@@ -195,9 +202,9 @@ mod tests {
         // The cache only has 2 pages, so the third write should move to the next page
         let reponse = cache.write(TestValue::from(789));
 
-        debug_assert!(reponse.page_id == 0);
-        debug_assert!(reponse.page_offset == 0);
-        debug_assert!(reponse.version == 1);
+        assert!(reponse.page_id == 0);
+        assert!(reponse.page_offset == 0);
+        assert!(reponse.version == 1);
 
         // Try read the old value, should return None
         let read_value: Option<TestValue> = cache.read(&read_request);
