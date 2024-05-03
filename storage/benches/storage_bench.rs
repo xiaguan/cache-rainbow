@@ -13,20 +13,29 @@ use storage::{FifoFileCache, MockRequest, WriteResponse};
 /// The write thread will random pick a key,value pair and write it to the storage
 /// The read thread will random pick a key follow zipf distribution and read it from the storage
 
-const CACHE_SIZE: usize = 1_000;
-const READER_COUNT: usize = 10;
+const CACHE_SIZE: usize = 10_000;
+const READER_COUNT: usize = 8;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct TestValue {
-    value: u64,
+    check_sum: u32,
+    value: Vec<u8>,
 }
 
-impl From<u64> for TestValue {
-    fn from(value: u64) -> Self {
-        Self { value }
+impl TestValue {
+    fn new() -> Self {
+        let mut rng = rand::thread_rng();
+        // 280 bytes value is the most common value size in real cache workload
+        let value: Vec<u8> = (0..280).map(|_| rng.gen()).collect();
+        let check_sum = crc32fast::hash(&value);
+        Self { check_sum, value }
+    }
+
+    fn validate(&self) {
+        let check_sum = crc32fast::hash(&self.value);
+        assert_eq!(check_sum, self.check_sum);
     }
 }
-
 impl storage::Value for TestValue {}
 
 enum CacheItenInner {
@@ -103,7 +112,8 @@ fn write_thread(
     let mut rng = rand::thread_rng();
     for _ in 0..write_count {
         let key = rng.gen_range(0..CACHE_SIZE as u64);
-        let value = TestValue::from(key);
+        let value = TestValue::new();
+        value.validate();
         let start = std::time::Instant::now();
         let response = cache.write(value);
         let elapsed = start.elapsed();
@@ -129,13 +139,11 @@ fn read_thread(
         let item = cache_map.items.get(&key).unwrap();
         let value = item.read(&cache);
         if let Some((value, reponse)) = value {
-            if value != TestValue::from(key) {
-                panic!("The value should be {}, but got {}", key, value.value);
-            }
             let elapsed = start.elapsed();
             trace_sender
                 .send(OperationTrace::Read(reponse, elapsed))
                 .unwrap();
+            value.validate();
         }
     }
 }
