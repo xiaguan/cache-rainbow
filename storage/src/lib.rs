@@ -1,5 +1,6 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
@@ -18,9 +19,9 @@ pub struct FifoFileCache {
     pages: Arc<[PageVersion]>,
     // The size of each page, it is fixed
     page_size: usize,
-    // The path of the file
-    path: PathBuf,
     manager: Mutex<WriteManger>,
+    // The file for reading
+    read_file: File,
 }
 
 struct WriteManger {
@@ -71,7 +72,8 @@ pub struct WriteResponse {
 }
 
 pub trait MockRequest<V>
-where V: Value
+where
+    V: Value,
 {
     // Read a value from the storage
     // Return none if the page_version is not the same as the version of the page
@@ -109,30 +111,41 @@ impl FifoFileCache {
             page_size,
             file,
         });
+        let read_file = File::open(&path).expect("Failed to open file");
         Self {
             pages,
             page_size,
-            path,
             manager,
+            read_file,
         }
     }
 }
 
 impl<V> MockRequest<V> for FifoFileCache
-where V: Value
+where
+    V: Value,
 {
     fn read(&self, request: &WriteResponse) -> Option<V> {
         assert!(request.length <= self.page_size);
         assert!(request.page_id < self.pages.len() as u64);
         assert!(request.page_offset + request.length as u64 <= self.page_size as u64);
         let offset = request.page_id * self.page_size as u64 + request.page_offset;
-        let mut file = File::open(&self.path).expect("Failed to open file");
-        file.seek(SeekFrom::Start(offset))
-            .expect("Failed to seek file");
-
         let mut buffer = vec![0; request.length];
-        file.read_exact(&mut buffer).expect("Failed to read file");
-
+        let mut bytes_read_total = 0;
+        loop {
+            let bytes_read = self
+                .read_file
+                .read_at(
+                    &mut buffer[bytes_read_total..],
+                    offset + bytes_read_total as u64,
+                )
+                .unwrap();
+            bytes_read_total += bytes_read;
+            if bytes_read_total == request.length || bytes_read == 0 {
+                break;
+            }
+        }
+        assert_eq!(bytes_read_total, request.length);
         // Each page's version is incremented by 1 after each write
         // Check the version after read, if it's not the same as the request version, return None
         let page_version =
