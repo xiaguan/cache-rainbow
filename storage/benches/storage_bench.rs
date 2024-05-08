@@ -105,7 +105,6 @@ struct Trace {
 fn write_thread(
     cache: Arc<FifoFileCache>,
     cache_map: Arc<Cache>,
-    write_duration: Duration,
     write_count: u64,
     trace_sender: std::sync::mpsc::Sender<OperationTrace>,
 ) {
@@ -121,8 +120,6 @@ fn write_thread(
             .send(OperationTrace::Write(response.clone(), elapsed))
             .unwrap();
         cache_map.items.get(&key).unwrap().update_file(response);
-
-        std::thread::sleep(write_duration);
     }
 }
 
@@ -197,7 +194,6 @@ fn main() {
         write_trace(trace_receiver);
     });
 
-    let write_duration = Duration::from_millis(1);
     let write_count = CACHE_SIZE as u64 * 10;
     let read_count = CACHE_SIZE as u64 * 200;
 
@@ -206,7 +202,7 @@ fn main() {
         let cache_map = cache_map.clone();
         let trace_sender = trace_sender.clone();
         std::thread::spawn(move || {
-            write_thread(cache, cache_map, write_duration, write_count, trace_sender);
+            write_thread(cache, cache_map, write_count, trace_sender);
         })
     };
 
